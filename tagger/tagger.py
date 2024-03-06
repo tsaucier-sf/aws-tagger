@@ -5,9 +5,12 @@ from retrying import retry
 import socket
 import csv
 
+
 def _is_retryable_exception(exception):
     return not isinstance(exception, botocore.exceptions.ClientError) or \
-        (exception.response["Error"]["Code"] in ['LimitExceededException', 'RequestLimitExceeded', 'Throttling', 'ParamValidationError'])
+        (exception.response["Error"]["Code"] in ['LimitExceededException', 'RequestLimitExceeded', 'Throttling',
+                                                 'ParamValidationError'])
+
 
 def _arn_to_name(resource_arn):
     # Example: arn:aws:elasticloadbalancing:us-east-1:397853141546:loadbalancer/pb-adn-arc2
@@ -19,6 +22,7 @@ def _arn_to_name(resource_arn):
 
     return name
 
+
 def _format_dict(tags):
     output = []
     for (key, value) in tags.items():
@@ -26,11 +30,14 @@ def _format_dict(tags):
 
     return ", ".join(output)
 
+
 def _dict_to_aws_tags(tags):
     return [{'Key': key, 'Value': value} for (key, value) in tags.items() if not key.startswith('aws:')]
 
+
 def _aws_tags_to_dict(aws_tags):
     return {x['Key']: x['Value'] for x in aws_tags if not x['Key'].startswith('aws:')}
+
 
 def _fetch_temporary_credentials(role):
     sts = boto3.client('sts', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
@@ -40,6 +47,7 @@ def _fetch_temporary_credentials(role):
     secret_access_key = response.get('Credentials', {}).get('SecretAccessKey', None)
     session_token = response.get('Credentials', {}).get('SessionToken', None)
     return access_key_id, secret_access_key, session_token
+
 
 def _client(name, role, region):
     kwargs = {}
@@ -57,9 +65,28 @@ def _client(name, role, region):
 
     return boto3.client(name, **kwargs)
 
+
+def _ec2_resource(role, region):
+    kwargs = {}
+
+    if region:
+        kwargs['region_name'] = region
+    elif os.environ.get('AWS_REGION'):
+        kwargs['region_name'] = os.environ['AWS_REGION']
+
+    if role:
+        access_key_id, secret_access_key, session_token = _fetch_temporary_credentials(role)
+        kwargs['aws_access_key_id'] = access_key_id
+        kwargs['aws_secret_access_key'] = secret_access_key
+        kwargs['aws_session_token'] = session_token
+
+    return boto3.resource("ec2", **kwargs)
+
+
 class SingleResourceTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None, tag_volumes=False):
         self.taggers = {}
+        self.taggers['ec2_resource'] = EC2ResourceTagger(dryrun, verbose, role=role, region=region, tag_volumes=tag_volumes)
         self.taggers['ec2'] = EC2Tagger(dryrun, verbose, role=role, region=region, tag_volumes=tag_volumes)
         self.taggers['elasticfilesystem'] = EFSTagger(dryrun, verbose, role=role, region=region)
         self.taggers['rds'] = RDSTagger(dryrun, verbose, role=role, region=region)
@@ -72,6 +99,8 @@ class SingleResourceTagger(object):
         self.taggers['logs'] = CloudWatchLogsTagger(dryrun, verbose, role=role, region=region)
         self.taggers['dynamodb'] = DynamoDBTagger(dryrun, verbose, role=role, region=region)
         self.taggers['lambda'] = LambdaTagger(dryrun, verbose, role=role, region=region)
+        self.taggers['cognito-idp'] = CognitoTagger(dryrun, verbose, role=role, region=region)
+        self.taggers['cloudtrail'] = CloudtrailTagger(dryrun, verbose, role=role, region=region)
 
     def tag(self, resource_id, tags):
         if resource_id == "":
@@ -89,7 +118,6 @@ class SingleResourceTagger(object):
         else:
             tagger = self.taggers['s3']
 
-
         if resource_id.startswith('i-'):
             tagger = self.taggers['ec2']
             resource_arn = resource_id
@@ -98,6 +126,15 @@ class SingleResourceTagger(object):
             resource_arn = resource_id
         elif resource_id.startswith('snap-'):
             tagger = self.taggers['ec2']
+            resource_arn = resource_id
+        elif resource_id.startswith('vpc-'):
+            tagger = self.taggers['ec2_resource']
+            resource_arn = resource_id
+        elif resource_id.startswith('subnet-'):
+            tagger = self.taggers['ec2_resource']
+            resource_arn = resource_id
+        elif resource_id.startswith('rtb-'):
+            tagger = self.taggers['ec2_resource']
             resource_arn = resource_id
 
         if tagger:
@@ -118,6 +155,7 @@ class SingleResourceTagger(object):
 
         return product, resource_id
 
+
 class MultipleResourceTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None, tag_volumes=False):
         self.tagger = SingleResourceTagger(dryrun, verbose, role=role, region=region, tag_volumes=tag_volumes)
@@ -125,6 +163,7 @@ class MultipleResourceTagger(object):
     def tag(self, resource_ids, tags):
         for resource_id in resource_ids:
             self.tagger.tag(resource_id, tags)
+
 
 class CSVResourceTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None, tag_volumes=False):
@@ -179,10 +218,49 @@ class CSVResourceTagger(object):
 
         tagger = self.regional_tagger.get(region)
         if tagger is None:
-            tagger = SingleResourceTagger(self.dryrun, self.verbose, role=self.role, region=region, tag_volumes=self.tag_volumes)
+            tagger = SingleResourceTagger(self.dryrun, self.verbose, role=self.role, region=region,
+                                          tag_volumes=self.tag_volumes)
             self.regional_tagger[region] = tagger
 
         return tagger
+
+
+class EC2ResourceTagger(object):
+    def __init__(self, dryrun, verbose, role=None, region=None):
+        self.dryrun = dryrun
+        self.verbose = verbose
+        self.ec2 = _ec2_resource(role=role, region=region)
+
+    def tag(self, resource_id, tags):
+        aws_tags = _dict_to_aws_tags(tags)
+        if self.verbose:
+            print("tagging %s with %s" % (", ".join(resource_id), _format_dict(tags)))
+        if not self.dryrun:
+            try:
+                if resource_id.startswith('vpc-'):
+                    self._vpc_create_tags(resource_id, Tags=aws_tags)
+                if resource_id.startswith('subnet-'):
+                    self._subnet_create_tags(resource_id, Tags=aws_tags)
+                if resource_id.startswith('rtb-'):
+                    self._subnet_create_tags(resource_id, Tags=aws_tags)
+            except botocore.exceptions.ClientError as exception:
+                if exception.response["Error"]["Code"]:
+                    print("Resource not found: %s" % resource_id)
+                else:
+                    raise exception
+
+    @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
+    def _vpc_create_tags(self, resource_id, **kwargs):
+        return self.ec2.Vpc(resource_id).create_tags(**kwargs)
+
+    @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
+    def _subnet_create_tags(self, resource_id, **kwargs):
+        return self.ec2.Subnet(resource_id).create_tags(**kwargs)
+
+    @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
+    def _route_table_create_tags(self, resource_id, **kwargs):
+        return self.ec2.RouteTable(resource_id).create_tags(**kwargs)
+
 
 class EC2Tagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None, tag_volumes=False):
@@ -194,7 +272,7 @@ class EC2Tagger(object):
             self.add_volume_cache()
 
     def add_volume_cache(self):
-        #TODO implement paging for describe instances
+        # TODO implement paging for describe instances
         reservations = self._ec2_describe_instances(MaxResults=1000)
 
         for reservation in reservations["Reservations"]:
@@ -218,11 +296,11 @@ class EC2Tagger(object):
             try:
                 self._ec2_create_tags(Resources=resource_ids, Tags=aws_tags)
             except botocore.exceptions.ClientError as exception:
-                if exception.response["Error"]["Code"] in ['InvalidSnapshot.NotFound', 'InvalidVolume.NotFound', 'InvalidInstanceID.NotFound']:
+                if exception.response["Error"]["Code"] in ['InvalidSnapshot.NotFound', 'InvalidVolume.NotFound',
+                                                           'InvalidInstanceID.NotFound']:
                     print("Resource not found: %s" % instance_id)
                 else:
                     raise exception
-
 
     @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
     def _ec2_describe_instances(self, **kwargs):
@@ -231,6 +309,7 @@ class EC2Tagger(object):
     @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
     def _ec2_create_tags(self, **kwargs):
         return self.ec2.create_tags(**kwargs)
+
 
 class EFSTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
@@ -256,6 +335,7 @@ class EFSTagger(object):
     @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
     def _efs_create_tags(self, **kwargs):
         return self.efs.create_tags(**kwargs)
+
 
 class DynamoDBTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
@@ -308,7 +388,7 @@ class CloudWatchLogsTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
         self.dryrun = dryrun
         self.verbose = verbose
-        self.logs= _client('logs', role=role, region=region)
+        self.logs = _client('logs', role=role, region=region)
 
     def tag(self, resource_arn, tags):
         if self.verbose:
@@ -359,6 +439,7 @@ class RDSTagger(object):
     def _rds_add_tags_to_resource(self, **kwargs):
         return self.rds.add_tags_to_resource(**kwargs)
 
+
 class LBTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
         self.dryrun = dryrun
@@ -392,6 +473,7 @@ class LBTagger(object):
     def _alb_add_tags(self, **kwargs):
         return self.alb.add_tags(**kwargs)
 
+
 class KinesisTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
         self.dryrun = dryrun
@@ -414,6 +496,7 @@ class KinesisTagger(object):
     @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
     def _kinesis_add_tags_to_stream(self, **kwargs):
         return self.kinesis.add_tags_to_stream(**kwargs)
+
 
 class ESTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
@@ -438,6 +521,7 @@ class ESTagger(object):
     def _es_add_tags(self, **kwargs):
         return self.es.add_tags(**kwargs)
 
+
 class ElasticacheTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
         self.dryrun = dryrun
@@ -461,6 +545,7 @@ class ElasticacheTagger(object):
     def _elasticache_add_tags_to_resource(self, **kwargs):
         return self.elasticache.add_tags_to_resource(**kwargs)
 
+
 class CloudfrontTagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
         self.dryrun = dryrun
@@ -480,9 +565,6 @@ class CloudfrontTagger(object):
                 else:
                     raise exception
 
-    @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
-    def _cloudfront_tag_resource(self, **kwargs):
-        return self.cloudfront.tag_resource(**kwargs)
 
 class S3Tagger(object):
     def __init__(self, dryrun, verbose, role=None, region=None):
@@ -523,3 +605,49 @@ class S3Tagger(object):
     def _s3_put_bucket_tagging(self, **kwargs):
         return self.s3.put_bucket_tagging(**kwargs)
 
+
+class CognitoTagger(object):
+    def __init__(self, dryrun, verbose, role=None, region=None):
+        self.dryrun = dryrun
+        self.verbose = verbose
+        self.cognito = _client('cognito-idp', role=role, region=region)
+
+    def tag(self, resource_arn, tags):
+        if self.verbose:
+            print("tagging %s with %s" % (resource_arn, _format_dict(tags)))
+        if not self.dryrun:
+            try:
+                self._cognito_tag_resource(Resource=resource_arn, Tags=tags)
+            except botocore.exceptions.ClientError as exception:
+                if exception.response["Error"]["Code"] in ['ResourceNotFoundException']:
+                    print("Resource not found: %s" % resource_arn)
+                else:
+                    raise exception
+
+    @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
+    def _cognito_tag_resource(self, **kwargs):
+        return self.cognito.tag_resource(**kwargs)
+
+
+class CloudtrailTagger(object):
+    def __init__(self, dryrun, verbose, role=None, region=None):
+        self.dryrun = dryrun
+        self.verbose = verbose
+        self.cloudtrail = _client('cloudtrail', role=role, region=region)
+
+    def tag(self, resource_arn, tags):
+        aws_tags = _dict_to_aws_tags(tags)
+        if self.verbose:
+            print("tagging %s with %s" % (resource_arn, _format_dict(tags)))
+        if not self.dryrun:
+            try:
+                self._cloudtrail_tag_resource(Resource=resource_arn, TagsList=aws_tags)
+            except botocore.exceptions.ClientError as exception:
+                if exception.response["Error"]["Code"] in ['ResourceNotFoundException']:
+                    print("Resource not found: %s" % resource_arn)
+                else:
+                    raise exception
+
+    @retry(retry_on_exception=_is_retryable_exception, stop_max_delay=30000, wait_exponential_multiplier=1000)
+    def _cloudtrail_tag_resource(self, **kwargs):
+        return self.cloudtrail.tag_resource(**kwargs)
